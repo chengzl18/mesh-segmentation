@@ -5,86 +5,60 @@ import numpy as np
 from numpy.linalg import norm
 from tqdm import tqdm
 import pickle
-import os
+from utils import timed
+"""
+import pyximport
+
+pyximport.install(language_level=3,
+                  setup_args={
+                      'include_dirs': np.get_include(),
+                      "script_args": ["--cython-cplus",'-O3']},
+                  reload_support=True)
+"""
+#import distutils.core
+#distutils.core.setup()
 
 
-def read_ply():
-    vertices, faces = [], []
-    with open('dino.ply', 'r') as f:
-        lines = [line.strip() for line in f.readlines()]
-    for i, line in enumerate(lines):
-        if line.startswith('element vertex'):
-            v_num = int(line.split(' ')[-1])
-        if line.startswith('element face'):
-            f_num = int(line.split(' ')[-1])
-        if line == 'endheader':
-            break
-    for line in lines[-(v_num + f_num):-f_num]:
-        x, y, z = line.split(' ')
-        vertices.append([float(x), float(y), float(z)])
-    for line in lines[-f_num:]:
-        v1, v2, v3 = line.split(' ')[1:4]
-        faces.append([int(v1), int(v2), int(v3)])
-    return np.array(vertices), np.array(faces)
+def dijkstra(f_nbrs, start):
+    f_dis = np.full(len(f_nbrs), np.inf)  # f_dis[i]是start到i的距离
+    f_dis[start] = 0
+    min_heap, visited = [(0, start)], set()  # min_heap: [(距离, fid)]
+    while min_heap:
+        cur_dis, cur = heapq.heappop(min_heap)
+        if cur in visited:
+            continue
+        visited.add(cur)
 
-
-def write_ply(model):
-    with open('output.ply', 'w') as f:
-        f.write(f"ply\nformat ascii 1.0\n"
-                f"element vertex {len(model.vs)}\nproperty float x\nproperty float y\nproperty float z\n"
-                f"element face {len(model.fs)}\nproperty list uchar int vertex_indices\n"
-                f"property uint8 red\nproperty uint8 green\nproperty uint8 blue\n"
-                f"end_header\n")
-        for v in model.vs:
-            f.write(f'{v[0]} {v[1]} {v[2]}\n')
-        for face in model.fs:
-            f.write(f'3 {face.vids[0]} {face.vids[1]} {face.vids[2]} ')
-            label = face.label
-            f.write(f'{60 * (label % 4 + 1)} {80 * ((label + 1) % 3 + 1)} {50 * ((label + 2) % 5 + 1)}\n')
+        for nid, n_dis in f_nbrs[cur]:
+            if nid in visited:
+                continue
+            dis = cur_dis + n_dis
+            if dis < f_dis[nid]:
+                f_dis[nid] = dis
+                heapq.heappush(min_heap, (dis, nid))
+    assert len(visited) == len(f_dis), f'{len(visited)} {len(f_dis)}'
+    return f_dis
 
 
 class NeighborInfo:
-    def __init__(self, ev, fid, angle, ang_dis, geo_dis):
-        self.vids = ev  # 邻边的顶点id
+    def __init__(self, e_vids, fid, angle, ang_dis, geo_dis):
+        self.vids = e_vids  # 邻边的两个顶点的id
         self.fid = fid  # 邻面的id
-        self.angle = angle  # 夹角
-        self.ang_dis = ang_dis
-        self.geo_dis = geo_dis
-        self.dis = 0
+        self.angle = angle  # 与邻面的夹角
+        self.ang_dis = ang_dis  # 与邻面的角距离
+        self.geo_dis = geo_dis  # 与邻面的测地距离
+        self.dis = 0  # 与邻面的距离度量
 
 
 class Face:
-    def __init__(self, vs, fv):
-        self.vids = fv  # 3个顶点的id
-        self.center = sum(vs) / 3  # 质心位置
-        self.norm = np.cross(vs[1] - vs[0], vs[2] - vs[0])  # 法向
-        norm_len = norm(self.norm)
-        self.norm = self.norm if norm_len < 1e-12 else self.norm / norm_len
+    def __init__(self, vs, vids):  # vs: 三个顶点的位置，vid: 三个顶点的id
+        self.vids = vids
+        self.center = sum(vs) / 3  # 三个顶点的质心位置
+        n = np.cross(vs[1] - vs[0], vs[2] - vs[0])  # 法向量
+        norm_len = norm(n)
+        self.norm = n if norm_len < 1e-12 else n / norm_len  # 单位法向量
         self.label = 0  # 分割标签
-        self.nbrs: List[NeighborInfo] = []  # 邻居面片的信息
-
-
-def compute_dis(f0: Face, f1: Face, ev):  # ev是邻边的两个顶点位置
-    # 计算两个面片之间的距离信息
-    angle = np.arccos(np.dot(f0.norm, f1.norm))
-    is_convex = np.dot(f0.norm, f1.center - f0.center) < 1e-12
-    eta = 0.2 if is_convex else 1.0  # 根据是否是凸的决定eta
-    ang_dis = eta * (1 - np.dot(f0.norm, f1.norm))
-
-    axis, d0, d1 = ev[1] - ev[0], f0.center - ev[0], f1.center - ev[0]  # 3个共起点的向量
-    axis_len, d0_len, d1_len = norm(axis), norm(d0), norm(d1)
-    angle0 = np.arccos(np.dot(d0, axis) / d0_len / axis_len)
-    angle1 = np.arccos(np.dot(d1, axis) / d1_len / axis_len)
-    # 如果将两个面片展平，测地距离就是两质心相连的直线段，构成一个三角形，夹角就是angle0+angle1，用余弦定理就能算出距离
-    geo_dis = d0_len * d0_len + d1_len * d1_len - 2 * d0_len * d1_len * np.cos(angle0 + angle1)
-
-    return angle, ang_dis, geo_dis
-
-
-class Edge:  # TODO: 这个Edge有必要存在吗？
-    def __init__(self, ev, fid):
-        self.vids = (ev[0], ev[1]) if ev[0] < ev[1] else (ev[1], ev[0])  # 两个顶点的id TODO:这个大小变换是否有问题
-        self.fid = fid  # 面片id
+        self.nbrs: List[NeighborInfo] = []  # 所有邻面的信息
 
 
 class FlowEdge:
@@ -96,35 +70,41 @@ class FlowEdge:
 
 
 class Model:
+    @staticmethod
+    def read_ply(ply_path):
+        # 读取文件，包括顶点和面
+        vertices, faces, v_num, f_num = [], [], 0, 0
+        with open(ply_path, 'r') as f:
+            lines = [line.strip() for line in f.readlines()]
+        for i, line in enumerate(lines):
+            if line.startswith('element vertex'):
+                v_num = int(line.split(' ')[-1])
+            if line.startswith('element face'):
+                f_num = int(line.split(' ')[-1])
+            if line == 'endheader':
+                break
+        for line in lines[-(v_num + f_num):-f_num]:
+            x, y, z = line.split(' ')
+            vertices.append([float(x), float(y), float(z)])
+        for line in lines[-f_num:]:
+            v1, v2, v3 = line.split(' ')[1:4]
+            faces.append([int(v1), int(v2), int(v3)])
+        return np.array(vertices), np.array(faces)
 
-    def __init__(self, vs, fs: List[List[int]]):
-        self.vs = vs  # 所有顶点位置
-        self.fs = [Face(vs[f], f) for f in fs]  # 所有面片
-        es = []
-        for i, f in enumerate(fs):
-            es.extend([Edge((f[0], f[1]), i), Edge((f[1], f[2]), i), Edge((f[2], f[0]), i)])  # 所有棱边
-        # 为所有面片找到与之相邻的面片，并计算相邻面片的角距离ang、测地距离geo和总距离
-        visited_es = {}
-        for e in es:
-            if e.vids not in visited_es:
-                visited_es[e.vids] = e.fid
-            else:  # 遇到第二次才进行计算
-                f0, f1 = visited_es[e.vids], e.fid
-                angle, ang_dis, geo_dis = compute_dis(self.fs[f0], self.fs[f1], vs[list(e.vids)])
-                self.fs[f0].nbrs.append(NeighborInfo(e.vids, f1, angle, ang_dis, geo_dis))
-                self.fs[f1].nbrs.append(NeighborInfo(e.vids, f0, angle, ang_dis, geo_dis))  # TODO: 边的方向要考虑吗？？
-        count = sum([len(f.nbrs) for f in self.fs])
-        avg_ang_dis = sum([sum([n.ang_dis for n in f.nbrs]) for f in self.fs]) / count
-        avg_geo_dis = sum([sum([n.geo_dis for n in f.nbrs]) for f in self.fs]) / count
-        for f in self.fs:
-            for n in f.nbrs:
-                n.dis = 0.2 * n.ang_dis / avg_ang_dis + 0.8 * n.geo_dis / avg_geo_dis  # TODO: delta？？
+    def __init__(self, ply_path):
+        import c_utils
+        self.vs, fs = Model.read_ply(ply_path)  # 所有顶点位置
+        self.fs = [Face(self.vs[f], f) for f in fs]  # 所有面片
+
+        # STEP 1:计算所有邻居的信息
+        avg_ang_dis = self.compute_neighbor()
+
+        # STEP 2:计算任意两个面片间的最短路径
         # f_dis[i][j] is the shortest distance from f[i] to f[j]
-        # 初始化路径图，用于计算最短路
         self.f_dis = np.full((len(self.fs), len(self.fs)), np.inf)
         self.compute_shortest()
 
-        # 初始化流图，用于计算最大流
+        # STEP3: 初始化流图，用于计算最大流
         self.edges: List[FlowEdge] = []  # TODO: 是否把G和edges合并起来？像他一样
         # G[x]，点x的所有边在edges中的下标，最后两个是用于的源点和汇点
         self.G: List[List[int]] = [[] for _ in range(len(self.fs) + 2)]
@@ -135,15 +115,83 @@ class Model:
         with open('model.pkl', 'wb') as f:
             pickle.dump(self, f)
 
+    @staticmethod
+    def compute_dis(f0: Face, f1: Face, e_vs):  # e_vs是邻边的两个顶点位置
+        # 计算两个面片之间的角距离
+        angle = np.arccos(np.dot(f0.norm, f1.norm))
+        is_convex = np.dot(f0.norm, f1.center - f0.center) < 1e-12
+        eta = 0.2 if is_convex else 1.0  # 根据是否是凸的决定eta
+        ang_dis = eta * (1 - np.dot(f0.norm, f1.norm))
+        # 计算两个面片之间的测地距离
+        # 计算方法：如果将两个面片展平，测地距离就是两质心相连的直线段，构成一个三角形，夹角就是angle0+angle1，用余弦定理就能算出距离
+        axis, d0, d1 = e_vs[1] - e_vs[0], f0.center - e_vs[0], f1.center - e_vs[0]  # 3个共起点的向量
+        axis_len, d0_len, d1_len = norm(axis), norm(d0), norm(d1)
+        angle0 = np.arccos(np.dot(d0, axis) / d0_len / axis_len)
+        angle1 = np.arccos(np.dot(d1, axis) / d1_len / axis_len)
+        geo_dis = d0_len * d0_len + d1_len * d1_len - 2 * d0_len * d1_len * np.cos(angle0 + angle1)
+
+        return angle, ang_dis, geo_dis
+
+    def compute_neighbor(self):  # 将所有面片的邻边信息计算出来
+        class Edge:  # TODO: 这个Edge有必要存在吗？
+            def __init__(self, ev, fid):
+                self.vids = (ev[0], ev[1]) if ev[0] < ev[1] else (ev[1], ev[0])  # 两个顶点的id，升序 TODO:这个大小变换是否有问题
+                self.fid = fid  # 面片id
+
+        es = []  # 所有棱边
+        for i, vids in enumerate([f.vids for f in self.fs]):
+            es.extend([Edge((vids[0], vids[1]), i), Edge((vids[1], vids[2]), i), Edge((vids[2], vids[0]), i)])
+        # 为所有面片找到与之相邻的面片，并计算相邻面片的角距离ang、测地距离geo和总距离
+        visited_es = {}
+        for e in es:
+            if e.vids not in visited_es:
+                visited_es[e.vids] = e.fid
+            else:  # 遇到第二次才进行计算
+                f0, f1 = visited_es[e.vids], e.fid
+                angle, ang_dis, geo_dis = Model.compute_dis(self.fs[f0], self.fs[f1], self.vs[list(e.vids)])
+                self.fs[f0].nbrs.append(NeighborInfo(e.vids, f1, angle, ang_dis, geo_dis))
+                self.fs[f1].nbrs.append(NeighborInfo(e.vids, f0, angle, ang_dis, geo_dis))  # TODO: 边的方向要考虑吗？？
+        count = sum([len(f.nbrs) for f in self.fs])
+        avg_ang_dis = sum([sum([n.ang_dis for n in f.nbrs]) for f in self.fs]) / count
+        avg_geo_dis = sum([sum([n.geo_dis for n in f.nbrs]) for f in self.fs]) / count
+        for f in self.fs:
+            for n in f.nbrs:
+                n.dis = 0.2 * n.ang_dis / avg_ang_dis + 0.8 * n.geo_dis / avg_geo_dis  # TODO: delta？？
+        return avg_ang_dis
+
+    @timed
     def compute_shortest(self):
+        from utils import parallel_run
+        import functools
+        import c_utils
         # Dijkstra算法
         # https://leetcode.com/problems/network-delay-time/discuss/329376/efficient-oe-log-v-python-dijkstra-min-heap-with-explanation
         # https://gist.github.com/kachayev/5990802
+        f_nbrs_id = [[n.fid for n in f.nbrs]+[-1]*(3-len(f.nbrs)) for f in self.fs]
+        f_nbrs_dis = [[n.dis for n in f.nbrs]+[-1]*(3-len(f.nbrs)) for f in self.fs]
+        f_nbrs_id,f_nbrs_dis = np.array(f_nbrs_id), np.array(f_nbrs_dis)
+        #for f_nbrs_i in f_nbrs_id:
+        #    print(f_nbrs_i)
+        f_nbrs = [[(n.fid, n.dis) for n in f.nbrs] for f in self.fs]
+        # solver.dijkstra(f_nbrs, 0)
+        # print('ok')
+        # exit(0)
+        # res = parallel_run(functools.partial(dijkstra, f_nbrs), list(range(len(self.fs))), 4)
+        res = parallel_run(functools.partial(c_utils.dijkstra, f_nbrs_id, f_nbrs_dis), list(range(len(self.fs))), 6)
+        self.f_dis = res
+        return
+        #for start in range(len(self.fs)):
+        #    self.f_dis[start] = res[start]
+        # return
+        # for start in tqdm(range(len(self.fs))):
+        #    self.f_dis[start] = c_utils.dijkstra(f_nbrs_id, f_nbrs_dis, start)
+        self.f_dis = c_utils.dijkstra(f_nbrs_id, f_nbrs_dis, np.arange(len(self.fs)))
+        print(self.f_dis)
+        print(self.f_dis.shape)
+        return
         for start in tqdm(range(len(self.fs))):
             self.f_dis[start][start] = 0
-            min_heap = [(0, start)]  # vertex is face. minheap of (distance, vertex) tuples. Initialize with (0, start).
-            visited = set()  # visited vertex
-
+            min_heap, visited = [(0, start)], set()  # min_heap: [(距离, fid)]
             while min_heap:
                 cur_dis, cur = heapq.heappop(min_heap)
                 if cur in visited:
@@ -157,11 +205,10 @@ class Model:
                     if dis < self.f_dis[start][n.fid]:
                         self.f_dis[start][n.fid] = dis
                         heapq.heappush(min_heap, (dis, n.fid))
-
             assert len(visited) == len(self.fs), f'{len(visited)} {len(self.fs)}'
 
     def compute_flow(self, f_types):  # TODO：怎么做好，对f_types不为0的这些面片求最大流
-        # f_types 无关区域0 边界区域1，2 模糊区域3
+        # f_types是所有面片目前的类型：无关区域0 边界区域1，2 模糊区域3。函数返回时，f_types的3都会变成1或2
         # TODO: 是否要区别无向图和有向图？还是说不用管，无向图就直接用两个有向边就行
         # Ford-Fulkerson增广路算法-EK算法
         # https://www.desgard.com/2020/03/03/max-flow-ford-fulkerson.html
@@ -229,14 +276,29 @@ class Model:
             sum_flow += flow_add
         return f_types
 
+    def write_ply(self, ply_path):
+        with open(ply_path, 'w') as f:
+            f.write(f"ply\nformat ascii 1.0\n"
+                    f"element vertex {len(self.vs)}\nproperty float x\nproperty float y\nproperty float z\n"
+                    f"element face {len(self.fs)}\nproperty list uchar int vertex_indices\n"
+                    f"property uint8 red\nproperty uint8 green\nproperty uint8 blue\n"
+                    f"end_header\n")
+            for v in self.vs:
+                f.write(f'{v[0]} {v[1]} {v[2]}\n')
+            for face in self.fs:
+                f.write(f'3 {face.vids[0]} {face.vids[1]} {face.vids[2]} ')
+                label = face.label
+                f.write(f'{60 * (label % 4 + 1)} {80 * ((label + 1) % 3 + 1)} {50 * ((label + 2) % 5 + 1)}\n')
+
 
 label_nums = 0
 
 
 class Solver:
-    def __init__(self, model, level, fids):
+    def __init__(self, model, level, fids=None):
         self.model = model
         self.eps = 0.04  # 判断哪些属于模糊区域
+        fids = fids if fids else list(range(len(model.fs)))
         self.fids = fids  # 对哪些面片做分解
         self.level = level  # 第几层
 
@@ -414,17 +476,14 @@ class Solver:
 
 
 def run():
-    # 读取文件，包括顶点和面
-    vertices, faces = read_ply()
-
     if False:  # os.path.exists('model.pkl'):
         with open('model.pkl', 'rb') as f:
             model = pickle.load(f)
     else:
-        model = Model(vertices, faces)
-    solver = Solver(model, 0, list(range(len(faces))))
+        model = Model('dino.ply')
+    solver = Solver(model, 0)
     solver.solve()
-    write_ply(model)
+    model.write_ply('dino_k.ply')
 
 
 if __name__ == '__main__':

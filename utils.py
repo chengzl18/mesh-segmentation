@@ -27,16 +27,14 @@ def equal_split(all_items, all_ids, n, split_manner):
         indices = np.array_split(range(total), n)
     else:
         indices = [list(range(total)[i::n]) for i in range(n)]
-    items = [[(all_ids[i], all_items[i]) for i in inds] for inds in indices]  # (id, doc)
+    items = [[all_items[i] for i in inds] for inds in indices]  # (id, doc)
     return items
 
 
 def single_run(func, docs):
     """用func逐一处理docs"""
     docs, pos = docs
-    res = []
-    for i, doc in docs:
-        res.append(func(doc))
+    res = func(np.array(docs))
     return res
 
 
@@ -60,5 +58,5 @@ def parallel_run(func, all_docs, num_proc, split_manner='chunk'):  # all_doc是�
         pids = list(range(num_proc))
         assert len(pids) == len(split_docs)
         for single_res in p.imap(functools.partial(single_run, func), list(zip(split_docs, pids))):
-            results.extend(single_res)
-    return results
+            results.append(single_res)
+    return np.concatenate(results, axis=0)
