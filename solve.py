@@ -3,6 +3,9 @@ import heapq
 from queue import Queue
 import numpy as np
 from numpy.linalg import norm
+from tqdm import tqdm
+import pickle
+import os
 
 
 def read_ply():
@@ -33,7 +36,7 @@ def write_ply(model):
                 f"property uint8 red\nproperty uint8 green\nproperty uint8 blue\n"
                 f"end_header\n")
         for v in model.vs:
-            f.write(f'{v[0]}{v[1]}{v[2]}\n')
+            f.write(f'{v[0]} {v[1]} {v[2]}\n')
         for face in model.fs:
             f.write(f'3 {face.vids[0]} {face.vids[1]} {face.vids[2]} ')
             label = face.label
@@ -105,9 +108,9 @@ class Model:
         for e in es:
             if e.vids not in visited_es:
                 visited_es[e.vids] = e.fid
-            else:
+            else:  # 遇到第二次才进行计算
                 f0, f1 = visited_es[e.vids], e.fid
-                angle, ang_dis, geo_dis = compute_dis(self.fs[f0], self.fs[f1], e.vids)
+                angle, ang_dis, geo_dis = compute_dis(self.fs[f0], self.fs[f1], vs[list(e.vids)])
                 self.fs[f0].nbrs.append(NeighborInfo(e.vids, f1, angle, ang_dis, geo_dis))
                 self.fs[f1].nbrs.append(NeighborInfo(e.vids, f0, angle, ang_dis, geo_dis))  # TODO: 边的方向要考虑吗？？
         count = sum([len(f.nbrs) for f in self.fs])
@@ -129,13 +132,15 @@ class Model:
             for n in f.nbrs:
                 self.edges.append(FlowEdge(i, n.fid, 1 / (1 + n.ang_dis / avg_ang_dis), 0))
                 self.G[i].append(len(self.edges) - 1)
+        with open('model.pkl', 'wb') as f:
+            pickle.dump(self, f)
 
     def compute_shortest(self):
         # Dijkstra算法
         # https://leetcode.com/problems/network-delay-time/discuss/329376/efficient-oe-log-v-python-dijkstra-min-heap-with-explanation
         # https://gist.github.com/kachayev/5990802
-        for start in range(len(self.fs)):
-            self.f_dis[start] = 0
+        for start in tqdm(range(len(self.fs))):
+            self.f_dis[start][start] = 0
             min_heap = [(0, start)]  # vertex is face. minheap of (distance, vertex) tuples. Initialize with (0, start).
             visited = set()  # visited vertex
 
@@ -153,7 +158,7 @@ class Model:
                         self.f_dis[start][n.fid] = dis
                         heapq.heappush(min_heap, (dis, n.fid))
 
-            assert len(visited) == len(self.fs)
+            assert len(visited) == len(self.fs), f'{len(visited)} {len(self.fs)}'
 
     def compute_flow(self, f_types):  # TODO：怎么做好，对f_types不为0的这些面片求最大流
         # f_types 无关区域0 边界区域1，2 模糊区域3
@@ -165,7 +170,7 @@ class Model:
         # 新建两个结点，一个源点，一个汇点
         G[-2], G[-1] = [], []
         start, target = len(G) - 2, len(G) - 1  # TODO:参数
-        f_types.extend([4, 4])
+        f_types = np.array(list(f_types) + [4, 4])
 
         # a = [0.0] * (len(self.fs) + 2)  # a[x], BFS中x的父边给到的流量, TODO: 这里没必要？
         p = [-1] * (len(self.fs) + 2)  # p[x], BFS中x的父边
@@ -235,7 +240,7 @@ class Solver:
         self.fids = fids  # 对哪些面片做分解
         self.level = level  # 第几层
 
-        self.fs = model.fs[fids]  # TODO: 这个fs是否有必要？直接用self.model.fs[xx]就行？
+        self.fs = [model.fs[fid] for fid in fids]  # TODO: 这个fs是否有必要？直接用self.model.fs[xx]就行？
         self.ori_fid2fid = {fid: i for i, fid in enumerate(fids)}
         self.f_dis = model.f_dis[fids][:, fids]
 
@@ -277,8 +282,8 @@ class Solver:
                 k = n.fid
                 # TODO: 是否需要和他一样
                 if model.fs[k].label == f.label:
-                    min_ang = min(n.ang, min_ang)
-                    max_ang = min(n.ang, max_ang)
+                    min_ang = min(n.angle, min_ang)
+                    max_ang = min(n.angle, max_ang)
         self.ang_diff = max_ang - min_ang
 
     def solve(self):
@@ -318,7 +323,7 @@ class Solver:
             # STEP1: 计算P
             # STEP1.1: 计算rep_dis
             for i in range(len(self.f_dis)):
-                local_label = self.fs[i].lavel - label_nums
+                local_label = self.fs[i].label - label_nums
                 if local_label < self.num:
                     counts[local_label] += 1
                     rep_dis[local_label] += self.f_dis[i]  # TODO: 可否直接改成一个np.sum，全部一起算？
@@ -354,7 +359,7 @@ class Solver:
                     for fid, f in zip(self.fids, self.fs):  # 这个fid是global的fid
                         if f.label == fuzzy_i or f.label == fuzzy_j:
                             f_types[fid] = 3
-                            for n in self.fs.nbrs:
+                            for n in f.nbrs:
                                 nf = self.model.fs[n.fid]
                                 if nf.label == label_nums + i:
                                     f_types[n.fid] = 1
@@ -377,7 +382,8 @@ class Solver:
                     for fid in self.fids:
                         if not any([self.model.fs[n.fid].label == self.model.fs[fid].label
                                     for n in self.model.fs[fid].nbrs]):
-                            assert False, "isolated face"
+                            pass
+                            # assert False, "isolated face"
 
         for step in range(20):  # 迭代20轮
             # STEP1: 用初始种子计算概率
@@ -410,7 +416,12 @@ class Solver:
 def run():
     # 读取文件，包括顶点和面
     vertices, faces = read_ply()
-    model = Model(vertices, faces)
+
+    if False:  # os.path.exists('model.pkl'):
+        with open('model.pkl', 'rb') as f:
+            model = pickle.load(f)
+    else:
+        model = Model(vertices, faces)
     solver = Solver(model, 0, list(range(len(faces))))
     solver.solve()
     write_ply(model)
