@@ -3,41 +3,8 @@ import heapq
 from queue import Queue
 import numpy as np
 from numpy.linalg import norm
-from tqdm import tqdm
-import pickle
 from utils import timed
-"""
-import pyximport
-
-pyximport.install(language_level=3,
-                  setup_args={
-                      'include_dirs': np.get_include(),
-                      "script_args": ["--cython-cplus",'-O3']},
-                  reload_support=True)
-"""
-#import distutils.core
-#distutils.core.setup()
-
-
-def dijkstra(f_nbrs, start):
-    f_dis = np.full(len(f_nbrs), np.inf)  # f_dis[i]是start到i的距离
-    f_dis[start] = 0
-    min_heap, visited = [(0, start)], set()  # min_heap: [(距离, fid)]
-    while min_heap:
-        cur_dis, cur = heapq.heappop(min_heap)
-        if cur in visited:
-            continue
-        visited.add(cur)
-
-        for nid, n_dis in f_nbrs[cur]:
-            if nid in visited:
-                continue
-            dis = cur_dis + n_dis
-            if dis < f_dis[nid]:
-                f_dis[nid] = dis
-                heapq.heappush(min_heap, (dis, nid))
-    assert len(visited) == len(f_dis), f'{len(visited)} {len(f_dis)}'
-    return f_dis
+from tqdm import tqdm
 
 
 class NeighborInfo:
@@ -92,7 +59,6 @@ class Model:
         return np.array(vertices), np.array(faces)
 
     def __init__(self, ply_path):
-        import c_utils
         self.vs, fs = Model.read_ply(ply_path)  # 所有顶点位置
         self.fs = [Face(self.vs[f], f) for f in fs]  # 所有面片
 
@@ -112,8 +78,6 @@ class Model:
             for n in f.nbrs:
                 self.edges.append(FlowEdge(i, n.fid, 1 / (1 + n.ang_dis / avg_ang_dis), 0))
                 self.G[i].append(len(self.edges) - 1)
-        with open('model.pkl', 'wb') as f:
-            pickle.dump(self, f)
 
     @staticmethod
     def compute_dis(f0: Face, f1: Face, e_vs):  # e_vs是邻边的两个顶点位置
@@ -133,9 +97,9 @@ class Model:
         return angle, ang_dis, geo_dis
 
     def compute_neighbor(self):  # 将所有面片的邻边信息计算出来
-        class Edge:  # TODO: 这个Edge有必要存在吗？
+        class Edge:
             def __init__(self, ev, fid):
-                self.vids = (ev[0], ev[1]) if ev[0] < ev[1] else (ev[1], ev[0])  # 两个顶点的id，升序 TODO:这个大小变换是否有问题
+                self.vids = (ev[0], ev[1]) if ev[0] < ev[1] else (ev[1], ev[0])  # 两个顶点的id，升序
                 self.fid = fid  # 面片id
 
         es = []  # 所有棱边
@@ -167,45 +131,11 @@ class Model:
         # Dijkstra算法
         # https://leetcode.com/problems/network-delay-time/discuss/329376/efficient-oe-log-v-python-dijkstra-min-heap-with-explanation
         # https://gist.github.com/kachayev/5990802
-        f_nbrs_id = [[n.fid for n in f.nbrs]+[-1]*(3-len(f.nbrs)) for f in self.fs]
-        f_nbrs_dis = [[n.dis for n in f.nbrs]+[-1]*(3-len(f.nbrs)) for f in self.fs]
-        f_nbrs_id,f_nbrs_dis = np.array(f_nbrs_id), np.array(f_nbrs_dis)
-        #for f_nbrs_i in f_nbrs_id:
-        #    print(f_nbrs_i)
-        f_nbrs = [[(n.fid, n.dis) for n in f.nbrs] for f in self.fs]
-        # solver.dijkstra(f_nbrs, 0)
-        # print('ok')
-        # exit(0)
-        # res = parallel_run(functools.partial(dijkstra, f_nbrs), list(range(len(self.fs))), 4)
+        f_nbrs_id = [[n.fid for n in f.nbrs] + [-1] * (3 - len(f.nbrs)) for f in self.fs]
+        f_nbrs_dis = [[n.dis for n in f.nbrs] + [-1] * (3 - len(f.nbrs)) for f in self.fs]
+        f_nbrs_id, f_nbrs_dis = np.array(f_nbrs_id), np.array(f_nbrs_dis)
         res = parallel_run(functools.partial(c_utils.dijkstra, f_nbrs_id, f_nbrs_dis), list(range(len(self.fs))), 6)
         self.f_dis = res
-        return
-        #for start in range(len(self.fs)):
-        #    self.f_dis[start] = res[start]
-        # return
-        # for start in tqdm(range(len(self.fs))):
-        #    self.f_dis[start] = c_utils.dijkstra(f_nbrs_id, f_nbrs_dis, start)
-        self.f_dis = c_utils.dijkstra(f_nbrs_id, f_nbrs_dis, np.arange(len(self.fs)))
-        print(self.f_dis)
-        print(self.f_dis.shape)
-        return
-        for start in tqdm(range(len(self.fs))):
-            self.f_dis[start][start] = 0
-            min_heap, visited = [(0, start)], set()  # min_heap: [(距离, fid)]
-            while min_heap:
-                cur_dis, cur = heapq.heappop(min_heap)
-                if cur in visited:
-                    continue
-                visited.add(cur)
-
-                for n in self.fs[cur].nbrs:
-                    if n.fid in visited:
-                        continue
-                    dis = cur_dis + n.dis
-                    if dis < self.f_dis[start][n.fid]:
-                        self.f_dis[start][n.fid] = dis
-                        heapq.heappush(min_heap, (dis, n.fid))
-            assert len(visited) == len(self.fs), f'{len(visited)} {len(self.fs)}'
 
     def compute_flow(self, f_types):  # TODO：怎么做好，对f_types不为0的这些面片求最大流
         # f_types是所有面片目前的类型：无关区域0 边界区域1，2 模糊区域3。函数返回时，f_types的3都会变成1或2
@@ -296,6 +226,7 @@ label_nums = 0
 
 class Solver:
     def __init__(self, model, level, fids=None):
+        # TODO: 所有东西都分成global和local的
         self.model = model
         self.eps = 0.04  # 判断哪些属于模糊区域
         fids = fids if fids else list(range(len(model.fs)))
@@ -308,7 +239,11 @@ class Solver:
 
         self.global_max_dis = model.f_dis.max()  # 整个模型最远的面片距离
         local_max_dis_fids = np.unravel_index(self.f_dis.argmax(), self.f_dis.shape)  # 最远的一对面片
-        self.loac_max_dis = self.f_dis[local_max_dis_fids]
+        self.local_max_dis = self.f_dis[local_max_dis_fids]  # TODO: local
+
+        average_func = lambda arr: np.sum(arr) / (len(arr) * (len(arr) - 1))
+        self.global_avg_dis = average_func(model.f_dis)
+        self.local_avg_dis = average_func(self.f_dis)
 
         def two_way_reps():
             return 2, list(local_max_dis_fids)  # 2路分解
@@ -316,7 +251,7 @@ class Solver:
         def k_way_reps():
             # 选作为到其他各点距离之和最小的点初始点
             reps = [np.argmin(np.sum(self.f_dis, axis=1))]
-            G = []
+            G = []  # TODO: 这个和那个图不要都叫G
             # 使最近的其他种子最远
             for i in range(20):  # 20个试验点
                 max_dis = 0
@@ -328,7 +263,7 @@ class Solver:
                         choice = fid
                 reps.append(choice)
                 G.append(max_dis)
-
+            print(G[:-1])
             # 最大化G[num]-G[num+1]
             num = np.argmax([G[num] - G[num + 1] for num in range(len(G) - 2)]) + 2
             reps = reps[:num]
@@ -445,9 +380,9 @@ class Solver:
                         if not any([self.model.fs[n.fid].label == self.model.fs[fid].label
                                     for n in self.model.fs[fid].nbrs]):
                             pass
-                            # assert False, "isolated face"
+                            # assert False, "isolated face" # This assertion error
 
-        for step in range(20):  # 迭代20轮
+        for step in tqdm(range(20), desc=f'{self.level} step'):  # 迭代20轮
             # STEP1: 用初始种子计算概率
             compute_assign_prob()
             # STEP2: 给面片打标签
@@ -463,28 +398,20 @@ class Solver:
         label_nums += self.num
 
         # 递归下去
-        loac_max_patch_dis = np.max(self.model.f_dis[self.reps][:, self.reps])
-        if self.level > 2 or loac_max_patch_dis / self.global_max_dis < 0.1:  # TODO: 把global的东西都放到model里
+        local_max_patch_dis = np.max(self.model.f_dis[self.reps][:, self.reps])
+        if self.level > 2 or local_max_patch_dis / self.global_max_dis < 0.1:  # TODO: 把global的东西都放到model里
             return
-        for k in range(self.num):
+        for k in tqdm(range(self.num), desc=f'{self.level} son'):
             fids = [fid for fid in self.fids if self.model.fs[fid].label % self.num == k]
             solver = Solver(self.model, self.level + 1, fids)
-            if solver.loac_max_dis / solver.global_max_dis > 0.2 and solver.ang_diff > 0.3:
+            print(solver.local_avg_dis / solver.global_avg_dis, solver.ang_diff)
+            if solver.local_avg_dis / solver.global_avg_dis > 0.2 and solver.ang_diff > 0.3:
                 solver.solve()
 
         # TODO: solverK呢， solverK会有一个mask，很怪！
 
 
-def run():
-    if False:  # os.path.exists('model.pkl'):
-        with open('model.pkl', 'rb') as f:
-            model = pickle.load(f)
-    else:
-        model = Model('dino.ply')
-    solver = Solver(model, 0)
-    solver.solve()
-    model.write_ply('dino_k.ply')
-
-
 if __name__ == '__main__':
-    run()
+    mesh_model = Model('dino.ply')
+    Solver(mesh_model, 0).solve()
+    mesh_model.write_ply('dino_k.ply')
