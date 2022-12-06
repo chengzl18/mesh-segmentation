@@ -250,20 +250,19 @@ class Solver:
 
         def k_way_reps():
             # 选作为到其他各点距离之和最小的点初始点
-            reps = [np.argmin(np.sum(self.f_dis, axis=1))]
+            reps = [np.argmin(np.sum(self.f_dis, axis=1))]  # local reps
             G = []  # TODO: 这个和那个图不要都叫G
             # 使最近的其他种子最远
             for i in range(20):  # 20个试验点
                 max_dis = 0
                 choice = 0
-                for fid in range(len(self.f_dis)):  # local
-                    min_dis = np.min([self.f_dis[fid][reps]])
+                for j in range(len(self.f_dis)):  # local
+                    min_dis = np.min([self.f_dis[j][reps]])
                     if min_dis > max_dis:
                         max_dis = min_dis
-                        choice = fid
+                        choice = j  # BUGFIX OK: use local
                 reps.append(choice)
                 G.append(max_dis)
-            print(G[:-1])
             # 最大化G[num]-G[num+1]
             num = np.argmax([G[num] - G[num + 1] for num in range(len(G) - 2)]) + 2
             reps = reps[:num]
@@ -280,7 +279,7 @@ class Solver:
                 # TODO: 是否需要和他一样
                 if model.fs[k].label == f.label:
                     min_ang = min(n.angle, min_ang)
-                    max_ang = min(n.angle, max_ang)
+                    max_ang = max(n.angle, max_ang) # BUGFIX: max
         self.ang_diff = max_ang - min_ang
 
     def solve(self):
@@ -348,7 +347,7 @@ class Solver:
 
         def assign_fuzzy():
             for i in range(self.num):
-                for j in range(self.num):  # 两片模糊区域间的面片两两分割
+                for j in range(i + 1, self.num):  # 两片模糊区域间的面片两两分割
                     f_types = np.zeros(len(self.model.fs))  # global的大小
                     # STEP1: 确定具体分割的面片
                     # 找到哪些是模糊区域 3， 哪些是边界区域1，2， 哪些是无关区域0
@@ -379,8 +378,7 @@ class Solver:
                     for fid in self.fids:
                         if not any([self.model.fs[n.fid].label == self.model.fs[fid].label
                                     for n in self.model.fs[fid].nbrs]):
-                            pass
-                            # assert False, "isolated face" # This assertion error
+                            print(f"isolated face {fid}")
 
         for step in tqdm(range(20), desc=f'{self.level} step'):  # 迭代20轮
             # STEP1: 用初始种子计算概率
@@ -399,11 +397,15 @@ class Solver:
 
         # 递归下去
         local_max_patch_dis = np.max(self.model.f_dis[self.reps][:, self.reps])
-        if self.level > 2 or local_max_patch_dis / self.global_max_dis < 0.1:  # TODO: 把global的东西都放到model里
+        if self.level > 0 or local_max_patch_dis / self.global_max_dis < 0.1:  # TODO: 把global的东西都放到model里
             return
-        for k in tqdm(range(self.num), desc=f'{self.level} son'):
+
+        sub_solvers = []
+        for k in range(self.num):
+            # BUGFIX OK: 先统一建好建所有solver，再统一solve，不然solve导致label被换了标记，取模运算会有问题
             fids = [fid for fid in self.fids if self.model.fs[fid].label % self.num == k]
-            solver = Solver(self.model, self.level + 1, fids)
+            sub_solvers.append(Solver(self.model, self.level + 1, fids))
+        for solver in sub_solvers:
             print(solver.local_avg_dis / solver.global_avg_dis, solver.ang_diff)
             if solver.local_avg_dis / solver.global_avg_dis > 0.2 and solver.ang_diff > 0.3:
                 solver.solve()
