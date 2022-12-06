@@ -36,6 +36,9 @@ class FlowEdge:
         self.flow = flow
 
 
+delta = 0.8
+
+
 class Model:
     @staticmethod
     def read_ply(ply_path):
@@ -114,13 +117,13 @@ class Model:
                 f0, f1 = visited_es[e.vids], e.fid
                 angle, ang_dis, geo_dis = Model.compute_dis(self.fs[f0], self.fs[f1], self.vs[list(e.vids)])
                 self.fs[f0].nbrs.append(NeighborInfo(e.vids, f1, angle, ang_dis, geo_dis))
-                self.fs[f1].nbrs.append(NeighborInfo(e.vids, f0, angle, ang_dis, geo_dis))  # TODO: 边的方向要考虑吗？？
+                self.fs[f1].nbrs.append(NeighborInfo(e.vids, f0, angle, ang_dis, geo_dis))
         count = sum([len(f.nbrs) for f in self.fs])
         avg_ang_dis = sum([sum([n.ang_dis for n in f.nbrs]) for f in self.fs]) / count
         avg_geo_dis = sum([sum([n.geo_dis for n in f.nbrs]) for f in self.fs]) / count
         for f in self.fs:
             for n in f.nbrs:
-                n.dis = 0.2 * n.ang_dis / avg_ang_dis + 0.8 * n.geo_dis / avg_geo_dis  # TODO: delta？？
+                n.dis = (1 - delta) * n.ang_dis / avg_ang_dis + delta * n.geo_dis / avg_geo_dis
         return avg_ang_dis
 
     @timed
@@ -137,28 +140,25 @@ class Model:
         res = parallel_run(functools.partial(c_utils.dijkstra, f_nbrs_id, f_nbrs_dis), list(range(len(self.fs))), 6)
         self.f_dis = res
 
-    def compute_flow(self, f_types):  # TODO：怎么做好，对f_types不为0的这些面片求最大流
-        # f_types是所有面片目前的类型：无关区域0 边界区域1，2 模糊区域3。函数返回时，f_types的3都会变成1或2
-        # TODO: 是否要区别无向图和有向图？还是说不用管，无向图就直接用两个有向边就行
-        # Ford-Fulkerson增广路算法-EK算法
+    def compute_flow(self, f_types):
+        # f_types是所有面片目前的类型：无关区域0 边界区域1，2 模糊区域3。
+        # 对f_types不为0的这些面片求最大流，函数返回时，f_types的3都会变成1或2
+        # 参考：
+        # Ford-Fulkerson增广路算法-EK算法。无向图等价于就直接用两个有向边就行。
         # https://www.desgard.com/2020/03/03/max-flow-ford-fulkerson.html
         # https://oi-wiki.org/graph/flow/max-flow/
-        edges, G = self.edges, self.G
+        edges, G = self.edges, self.G  # G[x]: 点x的所有边在edges中的下标，最后两个是用于源点和汇点
         # 新建两个结点，一个源点，一个汇点
         G[-2], G[-1] = [], []
-        start, target = len(G) - 2, len(G) - 1  # TODO:参数
+        start, target = len(G) - 2, len(G) - 1
         f_types = np.array(list(f_types) + [4, 4])
-
-        # a = [0.0] * (len(self.fs) + 2)  # a[x], BFS中x的父边给到的流量, TODO: 这里没必要？
-        p = [-1] * (len(self.fs) + 2)  # p[x], BFS中x的父边
-
         # 初始化流分布图
         for i, f_type in enumerate(f_types):
             if f_type == 1:
                 edges.append(FlowEdge(start, i, float('inf'), 0))
                 G[start].append(len(edges) - 1)
             elif f_type == 2:
-                edges.append(FlowEdge(i, target, float('inf'), 0))  # TODO: 搞清楚他的 ！=target的条件是什么情况
+                edges.append(FlowEdge(i, target, float('inf'), 0))
                 G[i].append(len(edges) - 1)
         for i, g in enumerate(G):
             if f_types[i]:  # 其他无关面片，流量溢出去不用管？
@@ -166,9 +166,10 @@ class Model:
                     edges[j].flow = 0
 
         sum_flow = 0  # 总最大流
+        p = [-1] * (len(self.fs) + 2)  # p[x], BFS中x的父边
         while True:
             # STEP1: 从源点一直BFS，碰到汇点就停
-            a = [0.0] * (len(self.fs) + 2)
+            a = [0.0] * (len(self.fs) + 2)  # a[x]: BFS中x的父边给到的流量
             a[start] = float('inf')
             q, q_history = Queue(), []  # 用q_history存储历史
             q.put(start)
@@ -182,7 +183,7 @@ class Model:
                         a[e.to] = min(a[cur], e.cap - e.flow)  # 设置流量
                         q.put(e.to)  # 继续搜
                         q_history.append(e.to)
-                if a[target]:  # TODO: 可以放到while语句里？
+                if a[target]:
                     break
             flow_add = a[target]
             if not flow_add:  # 已经搜索不到了，结束
@@ -201,7 +202,6 @@ class Model:
                 for eid in G[cur]:
                     if edges[eid].to == edges[p[cur]].fro:
                         edges[eid].flow -= flow_add
-                # edges[p[cur] + p[cur] % 2 * 2 - 1] -= flow_add
                 cur = edges[p[cur]].fro
             sum_flow += flow_add
         return f_types
@@ -239,14 +239,11 @@ class Solver:
 
         self.global_max_dis = model.f_dis.max()  # 整个模型最远的面片距离
         local_max_dis_fids = np.unravel_index(self.f_dis.argmax(), self.f_dis.shape)  # 最远的一对面片
-        self.local_max_dis = self.f_dis[local_max_dis_fids]  # TODO: local
+        self.local_max_dis = self.f_dis[local_max_dis_fids]
 
         average_func = lambda arr: np.sum(arr) / (len(arr) * (len(arr) - 1))
         self.global_avg_dis = average_func(model.f_dis)
         self.local_avg_dis = average_func(self.f_dis)
-
-        def two_way_reps():
-            return 2, list(local_max_dis_fids)  # 2路分解
 
         def k_way_reps():
             # 选作为到其他各点距离之和最小的点初始点
@@ -276,20 +273,18 @@ class Solver:
         for f in self.fs:
             for n in f.nbrs:
                 k = n.fid
-                # TODO: 是否需要和他一样
                 if model.fs[k].label == f.label:
                     min_ang = min(n.angle, min_ang)
-                    max_ang = max(n.angle, max_ang) # BUGFIX: max
+                    max_ang = max(n.angle, max_ang)  # BUGFIX: max
         self.ang_diff = max_ang - min_ang
 
     def solve(self):
         global label_nums
         # TODO: 注意区分fid和ori_fid一些列东西
-        # TODO: 如果直接改成sklearn聚类怎么样
         prob = np.zeros((self.num, len(self.f_dis)))
 
         def compute_assign_prob():
-            # TODO: mask是什么，目前看来全为1？mask是对标签的种子是否重复的判定，如果种子重合，只考虑一个标签
+            # 可以进一步考虑reps中有重复的种子面片的情况，如果种子重合，只考虑一个标签
             # 用初始种子计算概率
             for fid in range(len(self.f_dis)):  # 这里的fid, rep都是local的了
                 if fid in self.reps:
@@ -300,7 +295,6 @@ class Solver:
                     prob[rep][fid] = 1 / self.f_dis[fid][self.reps[rep]] / sum_prob
 
         def assign():
-            # TODO: mask是什么，目前看来全为1？
             # 给面片打标签
             for fid in range(len(self.f_dis)):
                 label1, label2 = heapq.nlargest(2, range(self.num), prob[:, fid].take)
@@ -371,14 +365,12 @@ class Solver:
                             self.model.fs[fid].label = label_nums + i
                         elif f_types[fid] == 2:
                             self.model.fs[fid].label = label_nums + j
-                        else:  # TODO: 没有必要？
-                            assert f_types[fid] == 0
 
                     # 检查是否有孤立的面片
                     for fid in self.fids:
                         if not any([self.model.fs[n.fid].label == self.model.fs[fid].label
                                     for n in self.model.fs[fid].nbrs]):
-                            print(f"isolated face {fid}")
+                            pass
 
         for step in tqdm(range(20), desc=f'{self.level} step'):  # 迭代20轮
             # STEP1: 用初始种子计算概率
@@ -390,8 +382,8 @@ class Solver:
                 break
 
         assign()
-        update_rep()  # TODO 这是否必要？
-        assign()  # TODO 这是否必要？
+        update_rep()
+        assign()
         assign_fuzzy()
         label_nums += self.num
 
@@ -406,11 +398,8 @@ class Solver:
             fids = [fid for fid in self.fids if self.model.fs[fid].label % self.num == k]
             sub_solvers.append(Solver(self.model, self.level + 1, fids))
         for solver in sub_solvers:
-            print(solver.local_avg_dis / solver.global_avg_dis, solver.ang_diff)
             if solver.local_avg_dis / solver.global_avg_dis > 0.2 and solver.ang_diff > 0.3:
                 solver.solve()
-
-        # TODO: solverK呢， solverK会有一个mask，很怪！
 
 
 if __name__ == '__main__':
