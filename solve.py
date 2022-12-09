@@ -62,6 +62,8 @@ class Model:
         self.f_dis = np.full((len(self.fs), len(self.fs)), np.inf)
         self.compute_shortest()
 
+        self.label_nums = 0  # 目前所有面片共有多少种类
+
     @staticmethod
     def compute_dis(f0: Face, f1: Face, e_vs):  # e_vs是邻边的两个顶点位置
         # 计算两个面片之间的角距离
@@ -210,34 +212,28 @@ class Model:
                 f.write(f'{60 * (label % 4 + 1)} {80 * ((label + 1) % 3 + 1)} {50 * ((label + 2) % 5 + 1)}\n')
 
 
-label_nums = 0
-
-
 class Solver:
     def __init__(self, model, level, fids=None):
-        # TODO: 所有东西都分成global和local的
+        # global variables
         self.model = model
-        self.eps = 0.04  # 判断哪些属于模糊区域
-        fids = fids if fids else list(range(len(model.fs)))
-        self.fids = fids  # 对哪些面片做分解
+        self.fids = fids if fids else list(range(len(model.fs)))  # 对哪些面片做分解
         self.level = level  # 第几层
+        # local variables
+        self.fs = [model.fs[fid] for fid in self.fids]
+        self.f_dis = model.f_dis[self.fids][:, self.fids]
 
-        self.fs = [model.fs[fid] for fid in fids]  # TODO: 这个fs是否有必要？直接用self.model.fs[xx]就行？
-        self.ori_fid2fid = {fid: i for i, fid in enumerate(fids)}
-        self.f_dis = model.f_dis[fids][:, fids]
-
-        self.global_max_dis = model.f_dis.max()  # 整个模型最远的面片距离
+        # 计算一些所需的平均距离
+        self.global_max_dis = self.model.f_dis.max()  # 整个模型最远的面片距离
         local_max_dis_fids = np.unravel_index(self.f_dis.argmax(), self.f_dis.shape)  # 最远的一对面片
         self.local_max_dis = self.f_dis[local_max_dis_fids]
-
         average_func = lambda arr: np.sum(arr) / (len(arr) * (len(arr) - 1))
-        self.global_avg_dis = average_func(model.f_dis)
+        self.global_avg_dis = average_func(self.model.f_dis)
         self.local_avg_dis = average_func(self.f_dis)
 
         def k_way_reps():
             # 选作为到其他各点距离之和最小的点初始点
             reps = [np.argmin(np.sum(self.f_dis, axis=1))]  # local reps
-            G = []  # TODO: 这个和那个图不要都叫G
+            G = []
             # 使最近的其他种子最远
             for i in range(20):  # 20个试验点
                 max_dis = 0
@@ -262,15 +258,14 @@ class Solver:
         for f in self.fs:
             for n in f.nbrs:
                 k = n.fid
-                if model.fs[k].label == f.label:
+                if self.model.fs[k].label == f.label:
                     min_ang = min(n.angle, min_ang)
                     max_ang = max(n.angle, max_ang)  # BUGFIX: max
         self.ang_diff = max_ang - min_ang
 
     def solve(self):
-        global label_nums
-        # TODO: 注意区分fid和ori_fid一些列东西
         prob = np.zeros((self.num, len(self.f_dis)))
+        OFFSET, FUZZY = self.model.label_nums, self.model.label_nums + self.num  # OFFSET之前共有多少种类，FUZZY标志模糊区域
 
         def compute_assign_prob():
             # 可以进一步考虑reps中有重复的种子面片的情况，如果种子重合，只考虑一个标签
@@ -284,36 +279,33 @@ class Solver:
                     prob[rep][fid] = 1 / self.f_dis[fid][self.reps[rep]] / sum_prob
 
         def assign():
+            eps = 0.04
             # 给面片打标签
             for fid in range(len(self.f_dis)):
                 label1, label2 = heapq.nlargest(2, range(self.num), prob[:, fid].take)
                 prob1, prob2 = prob[label1][fid], prob[label2][fid]
-                if prob1 - prob2 > self.eps:
-                    self.fs[fid].label = label_nums + label1
+                if prob1 - prob2 > eps:
+                    self.fs[fid].label = OFFSET + label1
                 else:
-                    self.fs[fid].label = 1024 + label1 * self.num + label2  # TODO:一个奇怪的定义
+                    self.fs[fid].label = FUZZY + label1 * self.num + label2
 
         def update_rep():
-            # 计算P(f∈local_label)
-            # rep_dis[k][i]表示第i个面片与第k个隐种子的距离，用第i个面片与其他同标签的所有面片的平均距离来表示，视为常量即可
-            # TODO: 改成rep_dis[i][k]
+            # rep_dis[k][i]表示第k类种子用i个面片代表的距离，即用第k类中面片i与所有面片的平均距离来表示，视为常量即可
             rep_dis = np.zeros((self.num, len(self.f_dis)))
             counts = np.zeros(self.num)  # 每个类别的数量
-            # STEP1: 计算P
+            # STEP1: 计算P(fi∈Sj)=rep_dis[j][i]
             # STEP1.1: 计算rep_dis
-            for i in range(len(self.f_dis)):
-                local_label = self.fs[i].label - label_nums
-                if local_label < self.num:
-                    counts[local_label] += 1
-                    rep_dis[local_label] += self.f_dis[i]  # TODO: 可否直接改成一个np.sum，全部一起算？
+            for k_f in range(len(self.f_dis)):
+                k = self.fs[k_f].label - OFFSET
+                if k < self.num:
+                    counts[k] += 1
+                    # k_f是一个新发现的第k类的面片，第k类每个面片i累加上k_f到i(也就是i到k_face)的距离。最终得到i到所有k类面片的距离累加
+                    rep_dis[k] += self.f_dis[k_f]
             for rep in range(self.num):
-                for i in range(len(self.f_dis)):
-                    rep_dis[rep][i] = rep_dis[rep][i] / counts[rep] if counts[rep] else np.inf
+                rep_dis[rep] = rep_dis[rep] / counts[rep] if counts[rep] else np.inf  # 求平均距离
             # STEP1.2: 计算概率P
             for i in range(len(self.f_dis)):
-                sum_prob = sum([1 / (rep_dis[rep][i] + 1e-12) for rep in range(self.num)])
-                for rep in range(self.num):
-                    prob[rep][i] = 1 / rep_dis[rep][i] / sum_prob
+                prob[:, i] = 1 / rep_dis[:, i] / np.sum(1 / (rep_dis[:, i] + 1e-12))
 
             # STEP2: 计算开销
             rep_cost = np.dot(prob, self.f_dis)  # rep_cost[rep][i]表示第rep个标签用i做种子的开销
@@ -321,9 +313,8 @@ class Solver:
             cost = [rep_cost[i][rep] for i, rep in enumerate(reps)]
 
             # STEP3: 判断是否更新
-            original_cost = [rep_cost[i][rep] for i, rep in enumerate(self.reps)]
-            changed = any(
-                [(c1 < c0 - 1e-12 and r1 != r0) for r1, r0, c1, c0 in zip(reps, self.reps, cost, original_cost)])
+            old_cost = [rep_cost[i][rep] for i, rep in enumerate(self.reps)]
+            changed = any([(c1 < c0 - 1e-12 and r1 != r0) for r1, r0, c1, c0 in zip(reps, self.reps, cost, old_cost)])
             if changed:
                 self.reps = reps
             return changed
@@ -334,15 +325,14 @@ class Solver:
                     f_types = np.zeros(len(self.model.fs))  # global的大小
                     # STEP1: 确定具体分割的面片
                     # 找到哪些是模糊区域 3， 哪些是边界区域1，2， 哪些是无关区域0
-                    fuzzy_i, fuzzy_j = 1024 + i * self.num + j, 1024 + j * self.num + i
                     for fid, f in zip(self.fids, self.fs):  # 这个fid是global的fid
-                        if f.label == fuzzy_i or f.label == fuzzy_j:
+                        if f.label == FUZZY + i * self.num + j or f.label == FUZZY + j * self.num + i:
                             f_types[fid] = 3
                             for n in f.nbrs:
                                 nf = self.model.fs[n.fid]
-                                if nf.label == label_nums + i:
+                                if nf.label == OFFSET + i:
                                     f_types[n.fid] = 1
-                                elif nf.label == label_nums + j:
+                                elif nf.label == OFFSET + j:
                                     f_types[n.fid] = 2
 
                     # STEP2: 进行分割
@@ -351,9 +341,9 @@ class Solver:
                     # STEP3: 执行分割结果
                     for fid in self.fids:  # local
                         if f_types[fid] == 1:
-                            self.model.fs[fid].label = label_nums + i
+                            self.model.fs[fid].label = OFFSET + i
                         elif f_types[fid] == 2:
-                            self.model.fs[fid].label = label_nums + j
+                            self.model.fs[fid].label = OFFSET + j
 
                     # 检查是否有孤立的面片
                     for fid in self.fids:
@@ -361,7 +351,7 @@ class Solver:
                                     for n in self.model.fs[fid].nbrs]):
                             pass
 
-        for step in tqdm(range(20), desc=f'{self.level} step'):  # 迭代20轮
+        for _ in tqdm(range(20), desc=f'{self.level} step'):  # 迭代20轮
             # STEP1: 用初始种子计算概率
             compute_assign_prob()
             # STEP2: 给面片打标签
@@ -374,17 +364,17 @@ class Solver:
         update_rep()
         assign()
         assign_fuzzy()
-        label_nums += self.num
+        self.model.label_nums += self.num
 
         # 递归下去
         local_max_patch_dis = np.max(self.model.f_dis[self.reps][:, self.reps])
-        if self.level > 0 or local_max_patch_dis / self.global_max_dis < 0.1:  # TODO: 把global的东西都放到model里
+        if self.level > 0 or local_max_patch_dis / self.global_max_dis < 0.1:
             return
 
         sub_solvers = []
-        for k in range(self.num):
+        for sid in range(self.num):
             # BUGFIX OK: 先统一建好建所有solver，再统一solve，不然solve导致label被换了标记，取模运算会有问题
-            fids = [fid for fid in self.fids if self.model.fs[fid].label % self.num == k]
+            fids = [fid for fid in self.fids if self.model.fs[fid].label % self.num == sid]
             sub_solvers.append(Solver(self.model, self.level + 1, fids))
         for solver in sub_solvers:
             if solver.local_avg_dis / solver.global_avg_dis > 0.2 and solver.ang_diff > 0.3:
