@@ -28,17 +28,6 @@ class Face:
         self.nbrs: List[NeighborInfo] = []  # 所有邻面的信息
 
 
-class FlowEdge:
-    def __init__(self, fro, to, cap, flow):
-        self.fro = fro
-        self.to = to
-        self.cap = cap
-        self.flow = flow
-
-
-delta = 0.8
-
-
 class Model:
     @staticmethod
     def read_ply(ply_path):
@@ -66,21 +55,12 @@ class Model:
         self.fs = [Face(self.vs[f], f) for f in fs]  # 所有面片
 
         # STEP 1:计算所有邻居的信息
-        avg_ang_dis = self.compute_neighbor()
+        self.compute_neighbor()
 
         # STEP 2:计算任意两个面片间的最短路径
         # f_dis[i][j] is the shortest distance from f[i] to f[j]
         self.f_dis = np.full((len(self.fs), len(self.fs)), np.inf)
         self.compute_shortest()
-
-        # STEP3: 初始化流图，用于计算最大流
-        self.edges: List[FlowEdge] = []  # TODO: 是否把G和edges合并起来？像他一样
-        # G[x]，点x的所有边在edges中的下标，最后两个是用于的源点和汇点
-        self.G: List[List[int]] = [[] for _ in range(len(self.fs) + 2)]
-        for i, f in enumerate(self.fs):
-            for n in f.nbrs:
-                self.edges.append(FlowEdge(i, n.fid, 1 / (1 + n.ang_dis / avg_ang_dis), 0))
-                self.G[i].append(len(self.edges) - 1)
 
     @staticmethod
     def compute_dis(f0: Face, f1: Face, e_vs):  # e_vs是邻边的两个顶点位置
@@ -119,12 +99,12 @@ class Model:
                 self.fs[f0].nbrs.append(NeighborInfo(e.vids, f1, angle, ang_dis, geo_dis))
                 self.fs[f1].nbrs.append(NeighborInfo(e.vids, f0, angle, ang_dis, geo_dis))
         count = sum([len(f.nbrs) for f in self.fs])
-        avg_ang_dis = sum([sum([n.ang_dis for n in f.nbrs]) for f in self.fs]) / count
+        self.avg_ang_dis = sum([sum([n.ang_dis for n in f.nbrs]) for f in self.fs]) / count
         avg_geo_dis = sum([sum([n.geo_dis for n in f.nbrs]) for f in self.fs]) / count
+        delta = 0.8
         for f in self.fs:
             for n in f.nbrs:
-                n.dis = (1 - delta) * n.ang_dis / avg_ang_dis + delta * n.geo_dis / avg_geo_dis
-        return avg_ang_dis
+                n.dis = (1 - delta) * n.ang_dis / self.avg_ang_dis + delta * n.geo_dis / avg_geo_dis
 
     @timed
     def compute_shortest(self):
@@ -147,39 +127,47 @@ class Model:
         # Ford-Fulkerson增广路算法-EK算法。无向图等价于就直接用两个有向边就行。
         # https://www.desgard.com/2020/03/03/max-flow-ford-fulkerson.html
         # https://oi-wiki.org/graph/flow/max-flow/
-        edges, G = self.edges, self.G  # G[x]: 点x的所有边在edges中的下标，最后两个是用于源点和汇点
-        # 新建两个结点，一个源点，一个汇点
-        G[-2], G[-1] = [], []
-        start, target = len(G) - 2, len(G) - 1
+
+        # 初始化流图，用于计算最大流
+        class FlowEdge:
+            def __init__(self, fro, to, cap, flow):
+                self.fro = fro
+                self.to = to
+                self.cap = cap
+                self.flow = flow
+
+        # es[x]，点x的所有邻边信息（起始点为x），最后两个是用于的源点和汇点
+        es: List[List[FlowEdge]] = [[] for _ in range(len(self.fs) + 2)]
+        for i, f in enumerate(self.fs):
+            for n in f.nbrs:
+                es[i].append(FlowEdge(i, n.fid, 1 / (1 + n.ang_dis / self.avg_ang_dis), 0))
+        start, target = len(es) - 2, len(es) - 1
         f_types = np.array(list(f_types) + [4, 4])
         # 初始化流分布图
         for i, f_type in enumerate(f_types):
             if f_type == 1:
-                edges.append(FlowEdge(start, i, float('inf'), 0))
-                G[start].append(len(edges) - 1)
+                es[start].append(FlowEdge(start, i, float('inf'), 0))
             elif f_type == 2:
-                edges.append(FlowEdge(i, target, float('inf'), 0))
-                G[i].append(len(edges) - 1)
-        for i, g in enumerate(G):
+                es[i].append(FlowEdge(i, target, float('inf'), 0))
+        for i in range(len(es)):
             if f_types[i]:  # 其他无关面片，流量溢出去不用管？
-                for j in g:
-                    edges[j].flow = 0
+                for e in es[i]:
+                    e.flow = 0
 
         sum_flow = 0  # 总最大流
-        p = [-1] * (len(self.fs) + 2)  # p[x], BFS中x的父边
         while True:
             # STEP1: 从源点一直BFS，碰到汇点就停
-            a = [0.0] * (len(self.fs) + 2)  # a[x]: BFS中x的父边给到的流量
+            p = [-1] * (len(self.fs) + 2)  # p[x], BFS中x的父结点
+            a = [0.0] * (len(self.fs) + 2)  # a[x]: BFS中x的父结点给到的流量
             a[start] = float('inf')
             q, q_history = Queue(), []  # 用q_history存储历史
             q.put(start)
             while not q.empty():
                 cur = q.get()
                 # 遍历cur的所有边e，如果e没有被搜索到且还有残余流量，就流
-                for eid in G[cur]:
-                    e = edges[eid]
+                for e in es[cur]:
                     if f_types[e.to] != 0 and not a[e.to] and e.cap > e.flow:
-                        p[e.to] = eid  # 设置父边
+                        p[e.to] = cur  # 设置父边
                         a[e.to] = min(a[cur], e.cap - e.flow)  # 设置流量
                         q.put(e.to)  # 继续搜
                         q_history.append(e.to)
@@ -197,12 +185,13 @@ class Model:
             # STEP2: 反向传播流量
             cur = target
             while cur != start:
-                edges[p[cur]].flow += flow_add  # 增加路径的flow值
-                # 减小反向路径的flow值
-                for eid in G[cur]:
-                    if edges[eid].to == edges[p[cur]].fro:
-                        edges[eid].flow -= flow_add
-                cur = edges[p[cur]].fro
+                for e in es[p[cur]]:
+                    if e.to == cur:
+                        e.flow += flow_add  # 增加路径的flow值
+                for e in es[cur]:
+                    if e.to == p[cur]:
+                        e.flow -= flow_add  # 减小反向路径的flow值
+                cur = p[cur]
             sum_flow += flow_add
         return f_types
 
