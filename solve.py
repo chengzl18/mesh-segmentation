@@ -287,9 +287,7 @@ class Solver:
         prob = np.zeros((self.num, len(self.f_dis)))
         OFFSET, FUZZY = self.model.label_nums, self.model.label_nums + self.num  # OFFSET之前共有多少种类，FUZZY标志模糊区域
 
-        def compute_assign_prob():
-            # 可以进一步考虑reps中有重复的种子面片的情况，如果种子重合，只考虑一个标签
-            # 用初始种子计算概率
+        def compute_prob():
             for fid in range(len(self.f_dis)):  # 这里的fid, rep都是local的了
                 if fid in self.reps:
                     prob[self.reps.index(fid)][fid] = 1
@@ -298,6 +296,7 @@ class Solver:
                 prob[:, fid] = 1 / self.f_dis[fid][self.reps] / sum_prob  # 计算平均
 
         def assign():  # 给面片打标签
+            # BUGFIX: dino不限制递归深度(level>2,注释同一行的条件)，输出和以前不一样了，是因为没有取eps=0.04
             eps = 0.04 if self.num <= 3 else 0.02  # 确定清晰区域的0.5+eps阈值, 这个参数需要调，对分割结果影响较大
             counts = np.zeros(self.num)  # 每个类别的数量
             prob[[i for i in range(self.num) if i not in self.uniques]] = 0
@@ -314,11 +313,12 @@ class Solver:
                 else:
                     self.fs[fid].label = FUZZY + label1 * self.num + label2
 
-        def update_rep(change_reps=True):
+        def recompute_reps():
+            # STEP1: 用论文3.3节最后一段的改进方法来计算P(fi∈Sj)=rep_dis[j][i]
+            assign()  # 先粗分类一下
             # rep_dis[k][i]表示第k类种子用i个面片代表的距离，即用第k类中面片i与所有面片的平均距离来表示，视为常量即可
             rep_dis = np.zeros((self.num, len(self.f_dis)))
             counts = np.zeros(self.num)  # 每个类别的数量
-            # STEP1: 计算P(fi∈Sj)=rep_dis[j][i]
             for k_f in range(len(self.f_dis)):  # 计算总距离累加
                 k = self.fs[k_f].label - OFFSET
                 if k < self.num:
@@ -329,18 +329,10 @@ class Solver:
                 rep_dis[k] = rep_dis[k] / counts[k] if counts[k] else np.inf  # 求平均距离
             prob[:] = 1 / (rep_dis + 1e-12) / np.sum(1 / (rep_dis + 1e-12), axis=0)  # 计算概率P
 
-            # STEP2: 计算开销
+            # STEP2: 用论文3.3节第2部分计算新的种子
             rep_cost = np.dot(prob, self.f_dis)  # rep_cost[rep][i]表示第rep个标签用i做种子的开销
             reps = list(np.argmin(rep_cost, axis=1))
-            cost = [rep_cost[i][rep] for i, rep in enumerate(reps)]
-
-            # STEP3: 判断是否更新
-            old_cost = [rep_cost[i][rep] for i, rep in enumerate(self.reps)]
-            changed = any([(c1 < c0 - 1e-12 and r1 != r0) for r1, r0, c1, c0 in zip(self.reps, reps, cost, old_cost)])
-            if changed and change_reps:
-                self.reps = reps
-                self.uniques = np.sort(np.unique(self.reps, return_index=True)[1])
-            return changed
+            return reps, rep_cost
 
         def assign_fuzzy():
             for i in self.uniques:
@@ -377,24 +369,31 @@ class Solver:
                             pass
 
         for _ in tqdm(range(20), desc=f'{self.level} step'):  # 迭代20轮
-            # STEP1: 用初始种子计算概率
-            compute_assign_prob()
+            # 论文3.3中的STEP1: 计算概率
+            compute_prob()
+            # 论文3.3中的STEP2: 重新计算reps
             # STEP2: 给面片打标签
-            assign()
-            change = update_rep()  # 每一步的依据都是用平均值估计的reps
-            if not change:
-                assign()
-                update_rep(change_reps=False)
-                assign()
+            new_reps, cost = recompute_reps()
+            # STEP3: 判断是否更新
+            new_cost = [cost[i][rep] for i, rep in enumerate(new_reps)]
+            old_cost = [cost[i][rep] for i, rep in enumerate(self.reps)]
+            changed = any([(c1 < c0 - 1e-12 and r1 != r0)
+                           for r1, r0, c1, c0 in zip(new_reps, self.reps, new_cost, old_cost)])
+            if changed:
+                self.reps = new_reps
+                self.uniques = np.sort(np.unique(self.reps, return_index=True)[1])
+            else:
                 break
 
-        assign_fuzzy()
+        recompute_reps()
+        assign()  # 清晰部分
+        assign_fuzzy()  # 模糊部分
         self.model.label_nums += self.num
 
         # 递归下去
         reps_f_dis = self.f_dis[self.reps][:, self.reps]
         local_max_patch_dis = np.max(reps_f_dis)
-        if self.level > 0 or local_max_patch_dis / self.global_max_dis < 0.1:  # 最多只递归一层
+        if self.level > 4 or local_max_patch_dis / self.global_max_dis < 0.1:  # 最多只递归一层
             return
 
         sub_solvers = []
@@ -409,6 +408,7 @@ class Solver:
 
 
 if __name__ == '__main__':
-    mesh_model = Model('dino.ply')
+    ply = 'dino'  # 'dino' 'horse'
+    mesh_model = Model(f'data/{ply}.ply')
     Solver(mesh_model, 0).solve()
-    mesh_model.write_ply('dino_output.ply')
+    mesh_model.write_ply(f'data/{ply}-output.ply')
