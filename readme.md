@@ -10,15 +10,15 @@ python版本的***Hierarchical Mesh Decomposition using Fuzzy Clustering and Cut
 #### 效果
 
 <p float="left">
-  <img src="./data/horse-output-left.png" height="400" />
-  <img src="./data/horse-output-right.png" height="400" /> 
+  <img src="./data/horse-output-left.png" height="300" />
+  <img src="./data/horse-output-right.png" height="300" /> 
 </p>
 
 
 
 <p float="left">
-  <img src="./data/dino-output-left.png" height="400" />
-  <img src="./data/dino-output-right.png" height="400" /> 
+  <img src="./data/dino-output-left.png" height="300" />
+  <img src="./data/dino-output-right.png" height="300" /> 
 </p>
 
 
