@@ -46,7 +46,6 @@ class Face:
 class Model:
     @staticmethod
     def read_ply(ply_path):
-        # 读取文件，包括顶点和面
         vertices, faces, v_num, f_num = [], [], 0, 0
         with open(ply_path, 'r') as f:
             lines = [line.strip() for line in f.readlines()]
@@ -72,13 +71,11 @@ class Model:
         # STEP 1:计算所有邻居的信息
         self.avg_ang_dis = 0
         self.compute_neighbor()
-
         # STEP 2:计算任意两个面片间的最短路径
-        # f_dis[i][j] is the shortest distance from f[i] to f[j]
         self.f_dis = np.full((len(self.fs), len(self.fs)), np.inf)
         self.compute_shortest()
 
-        self.label_nums = 0  # 目前所有面片共有多少种类
+        self.label_nums = 0  # 目前所有面片已分割出多少种类
 
     @staticmethod
     def compute_dis(f0: Face, f1: Face, e_vs):  # e_vs是邻边的两个顶点位置
@@ -129,12 +126,12 @@ class Model:
         import multiprocessing
         import functools
         import dijkstra
-        f_nbrs_id = [[n.fid for n in f.nbrs] for f in self.fs]  # 需要保证每个面片都有3个邻居
+        f_nbrs_id = [[n.fid for n in f.nbrs] for f in self.fs]
         f_nbrs_dis = [[n.dis for n in f.nbrs] for f in self.fs]
-        assert all([len(x) == 3 for x in f_nbrs_id])
+        assert all([len(x) == 3 for x in f_nbrs_id])  # 要求每个面片都有3个邻居
         f_nbrs_id, f_nbrs_dis = np.array(f_nbrs_id), np.array(f_nbrs_dis)
 
-        num_proc = 6
+        num_proc = 6  # 最短路算法并行，并行进程数
         with multiprocessing.Pool(num_proc) as p:
             results = [res for res in p.imap(functools.partial(dijkstra.dijkstra_c, f_nbrs_id, f_nbrs_dis),
                                              np.array_split(list(range(len(self.fs))), num_proc))]
@@ -163,14 +160,13 @@ class Model:
                 es[i].append(FlowEdge(i, n.fid, 1 / (1 + n.ang_dis / self.avg_ang_dis), 0))
         start, target = len(es) - 2, len(es) - 1
         f_types = np.array(list(f_types) + [4, 4])
-        # 初始化流分布图
         for i, f_type in enumerate(f_types):
             if f_type == 1:
                 es[start].append(FlowEdge(start, i, float('inf'), 0))
             elif f_type == 2:
                 es[i].append(FlowEdge(i, target, float('inf'), 0))
         for i in range(len(es)):
-            if f_types[i]:  # 其他无关面片，流量溢出去不用管？
+            if f_types[i]:
                 for e in es[i]:
                     e.flow = 0
 
@@ -184,8 +180,7 @@ class Model:
             q.put(start)
             while not q.empty():
                 cur = q.get()
-                # 遍历cur的所有边e，如果e没有被搜索到且还有残余流量，就流
-                for e in es[cur]:
+                for e in es[cur]:  # 遍历cur的所有边e，如果e没有被搜索到且还有残余流量，就流
                     if f_types[e.to] != 0 and not a[e.to] and e.cap > e.flow:
                         p[e.to] = cur  # 设置父边
                         a[e.to] = min(a[cur], e.cap - e.flow)  # 设置流量
@@ -194,8 +189,7 @@ class Model:
                 if a[target]:
                     break
             flow_add = a[target]
-            if not flow_add:  # 已经搜索不到了，结束
-                # BFS涉及的区域，都是1
+            if not flow_add:  # 已经搜索不到了，结束，BFS涉及的区域，都是1
                 for i in q_history:
                     f_types[i] = 1
                 for i in range(len(self.fs)):
@@ -231,32 +225,31 @@ class Model:
         print(f'save to {ply_path}')
 
 
-class Solver:
+class Segment:
     def __init__(self, model, level, fids=None):
         # global
         self.model = model
-        self.fids = fids if fids else list(range(len(model.fs)))  # 对哪些面片做分解
-        self.level = level  # 第几层
+        self.fids = fids if fids else list(range(len(model.fs)))  # 只考虑哪些面片
+        self.level = level  # 层次化分解的深度
         # local
         self.fs = [model.fs[fid] for fid in self.fids]
         self.f_dis = model.f_dis[self.fids][:, self.fids]
 
-        # 计算一些所需的最大距离/平均距离
         def average(arr):
             return np.sum(arr) / (len(arr) * (len(arr) - 1))
 
+        # 计算一些所需的最大距离/平均距离
         local_max_dis_fids = np.unravel_index(self.f_dis.argmax(), self.f_dis.shape)  # 最远的一对面片
         self.global_max_dis = self.model.f_dis.max() - self.model.f_dis.min()
-        assert self.global_max_dis != np.inf  # 必须是连通图
+        assert self.global_max_dis != np.inf  # 要求是连通图
         self.global_avg_dis, self.local_avg_dis = average(self.model.f_dis), average(self.f_dis)
 
         def k_way_reps():
-            # 选作为到其他各点距离之和最小的点初始点
-            reps, G = [np.argmin(np.sum(self.f_dis, axis=1))], []  # local reps
-            # 使最近的其他种子最远
-            for i in range(20):  # 20个试验点
+            # 选到其他各点距离之和最小的点初始点
+            reps, G = [np.argmin(np.sum(self.f_dis, axis=1))], []
+            for i in range(20):  # 20个试验点，每次新加入一个种子使最近的种子最远
                 rep, max_dis = 0, 0.0
-                for j in range(len(self.f_dis)):  # local
+                for j in range(len(self.f_dis)):
                     min_dis = np.min([self.f_dis[j][reps]])
                     if min_dis > max_dis:
                         max_dis = min_dis
@@ -267,15 +260,15 @@ class Solver:
             # NOTE: 如果想进行二路分解，只需要直接在此处设置num=2
             return num, reps[:num]  # 种子数和代表点
 
-        self.num, self.reps = k_way_reps()  # 重要：reps是local变量
-        # 用uniques, 只记录没有重复的reps的索引，有可能出现种子重复的情况，只考虑不重复的种子
+        self.num, self.reps = k_way_reps()  # 注意: reps是local变量，即reps[i]的值作为self.f_dis的索引而不是self.model.f_dis
+        # 用uniques记录不重复的reps的索引，有可能出现种子重复的情况，只考虑不重复的种子
         self.uniques = np.sort(np.unique(self.reps, return_index=True)[1])
 
         if self.num == 2:
             rep0, rep1 = sorted(local_max_dis_fids)
             self.reps[0], self.reps[1] = rep0, rep1
 
-        # 计算 相邻面片且标签相同 这些面片对夹角的极差
+        # 计算同类相邻面片夹角的极差
         max_ang, min_ang = 0, np.pi
         for f in self.fs:
             for n in f.nbrs:
@@ -283,21 +276,20 @@ class Solver:
                     min_ang, max_ang = min(n.angle, min_ang), max(n.angle, max_ang)
         self.ang_diff = max_ang - min_ang
 
-    def solve(self):
+    def seg(self):
         prob = np.zeros((self.num, len(self.f_dis)))
         OFFSET, FUZZY = self.model.label_nums, self.model.label_nums + self.num  # OFFSET之前共有多少种类，FUZZY标志模糊区域
 
         def compute_prob():
-            for fid in range(len(self.f_dis)):  # 这里的fid, rep都是local的了
+            for fid in range(len(self.f_dis)):
                 if fid in self.reps:
                     prob[self.reps.index(fid)][fid] = 1
                     continue
-                sum_prob = sum([1 / self.f_dis[fid][self.reps[u]] for u in self.uniques])  # 占比也只考虑不重合的点
+                sum_prob = sum([1 / self.f_dis[fid][self.reps[u]] for u in self.uniques])  # 只考虑不重合的点
                 prob[:, fid] = 1 / self.f_dis[fid][self.reps] / sum_prob  # 计算平均
 
         def assign():  # 给面片打标签
-            # BUGFIX: dino不限制递归深度(level>2,注释同一行的条件)，输出和以前不一样了，是因为没有取eps=0.04
-            eps = 0.04 if self.num <= 3 else 0.02  # 确定清晰区域的0.5+eps阈值, 这个参数需要调，对分割结果影响较大
+            eps = 0.04 if self.num <= 3 else 0.02  # 确定清晰区域的阈值, 这个参数需要调，对分割结果影响较大
             counts = np.zeros(self.num)  # 每个类别的数量
             prob[[i for i in range(self.num) if i not in self.uniques]] = 0
             for fid in range(len(self.f_dis)):
@@ -306,7 +298,6 @@ class Solver:
                     prob1, prob2 = prob[label1][fid], prob[label2][fid]
                 else:
                     label1, label2, prob1, prob2 = self.uniques[0], -1, 1.0, 0.0
-
                 if prob1 - prob2 > eps:
                     self.fs[fid].label = OFFSET + label1
                     counts[label1] += 1
@@ -314,35 +305,33 @@ class Solver:
                     self.fs[fid].label = FUZZY + label1 * self.num + label2
 
         def recompute_reps():
-            # STEP1: 用论文3.3节最后一段的改进方法来计算P(fi∈Sj)=rep_dis[j][i]
+            # STEP1: 用论文3.3节最后一段的改进方法来计算P(fi∈Sj)
             assign()  # 先粗分类一下
-            # rep_dis[k][i]表示第k类种子用i个面片代表的距离，即用第k类中面片i与所有面片的平均距离来表示，视为常量即可
+            # rep_dis[k][i]表示第k类种子到第i个面片的距离，用面片i到所有第k类面片的的平均距离来表示
             rep_dis = np.zeros((self.num, len(self.f_dis)))
             counts = np.zeros(self.num)  # 每个类别的数量
             for k_f in range(len(self.f_dis)):  # 计算总距离累加
                 k = self.fs[k_f].label - OFFSET
                 if k < self.num:
                     counts[k] += 1
-                    # k_f是一个新发现的第k类的面片，第k类每个面片i累加上k_f到i(也就是i到k_face)的距离。最终得到i到所有k类面片的距离累加
+                    # k_f是一个新发现的第k类的面片，每个面片i累加上k_f到i(也就是i到k_f)的距离。最终得到i到所有k类面片的距离累加
                     rep_dis[k] += self.f_dis[k_f]
             for k in range(self.num):
                 rep_dis[k] = rep_dis[k] / counts[k] if counts[k] else np.inf  # 求平均距离
             prob[:] = 1 / (rep_dis + 1e-12) / np.sum(1 / (rep_dis + 1e-12), axis=0)  # 计算概率P
-
             # STEP2: 用论文3.3节第2部分计算新的种子
-            rep_cost = np.dot(prob, self.f_dis)  # rep_cost[rep][i]表示第rep个标签用i做种子的开销
+            rep_cost = np.dot(prob, self.f_dis)  # rep_cost[k][i]表示第k个类用i做种子的开销
             reps = list(np.argmin(rep_cost, axis=1))
             return reps, rep_cost
 
         def assign_fuzzy():
-            for i in self.uniques:
-                for j in self.uniques:  # 两片模糊区域间的面片两两分割
+            for i in self.uniques:  # 两片模糊区域间的面片两两分割
+                for j in self.uniques:
                     if j <= i:
                         continue
-                    f_types = np.zeros(len(self.model.fs))  # global的大小
-                    # STEP1: 确定具体分割的面片
-                    # 找到哪些是模糊区域 3， 哪些是边界区域1，2， 哪些是无关区域0
-                    for fid, f in zip(self.fids, self.fs):  # 这个fid是global的fid
+                    f_types = np.zeros(len(self.model.fs))
+                    # STEP1: 确定具体分割的面片，找到哪些是模糊区域 3， 哪些是边界区域1，2， 哪些是无关区域0
+                    for fid, f in zip(self.fids, self.fs):
                         if f.label == FUZZY + i * self.num + j or f.label == FUZZY + j * self.num + i:
                             f_types[fid] = 3
                             for n in f.nbrs:
@@ -351,28 +340,19 @@ class Solver:
                                     f_types[n.fid] = 1
                                 elif nf.label == OFFSET + j:
                                     f_types[n.fid] = 2
-
-                    # STEP2: 进行分割
+                    # STEP2: 计算分割
                     f_types = self.model.compute_flow(f_types)
-
                     # STEP3: 执行分割结果
-                    for fid in self.fids:  # local
+                    for fid in self.fids:
                         if f_types[fid] == 1:
                             self.model.fs[fid].label = OFFSET + i
                         elif f_types[fid] == 2:
                             self.model.fs[fid].label = OFFSET + j
 
-                    # 检查是否有孤立的面片
-                    for fid in self.fids:
-                        if not any([self.model.fs[n.fid].label == self.model.fs[fid].label
-                                    for n in self.model.fs[fid].nbrs]):
-                            pass
-
-        for _ in tqdm(range(20), desc=f'{self.level} step'):  # 迭代20轮
+        for _ in tqdm(range(20), desc=f'{self.level} step'):
             # 论文3.3中的STEP1: 计算概率
             compute_prob()
             # 论文3.3中的STEP2: 重新计算reps
-            # STEP2: 给面片打标签
             new_reps, cost = recompute_reps()
             # STEP3: 判断是否更新
             new_cost = [cost[i][rep] for i, rep in enumerate(new_reps)]
@@ -390,25 +370,25 @@ class Solver:
         assign_fuzzy()  # 模糊部分
         self.model.label_nums += self.num
 
-        # 递归下去
         reps_f_dis = self.f_dis[self.reps][:, self.reps]
         local_max_patch_dis = np.max(reps_f_dis)
-        if self.level > 4 or local_max_patch_dis / self.global_max_dis < 0.1:  # 最多只递归一层
+        if self.level > 0 or local_max_patch_dis / self.global_max_dis < 0.1:  # 最多只递归一层，可调
             return
 
-        sub_solvers = []
+        # 递归
+        segments = []
         for sid in range(self.num):
             if sid in self.uniques:
-                # 先统一建好建所有solver，再统一solve，不然solve导致label被换了标记，取模运算会有问题
+                # 先统一建好建所有segment，再统一seg，不然seg导致label被换了标记，取模运算会有问题
                 fids = [fid for fid in self.fids if self.model.fs[fid].label % self.num == sid]
-                sub_solvers.append(Solver(self.model, self.level + 1, fids))
-        for solver in sub_solvers:
-            if solver.ang_diff > 0.3 and solver.local_avg_dis / solver.global_avg_dis > 0.2:
-                solver.solve()
+                segments.append(Segment(self.model, self.level + 1, fids))
+        for segment in segments:
+            if segment.ang_diff > 0.3 and segment.local_avg_dis / segment.global_avg_dis > 0.2:
+                segment.seg()
 
 
 if __name__ == '__main__':
-    ply = 'dino'  # 'dino' 'horse'
+    ply = 'horse'  # 'dino' 'horse'
     mesh_model = Model(f'data/{ply}.ply')
-    Solver(mesh_model, 0).solve()
+    Segment(mesh_model, 0).seg()
     mesh_model.write_ply(f'data/{ply}-output.ply')
