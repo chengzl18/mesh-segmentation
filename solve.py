@@ -3,8 +3,23 @@ import heapq
 from queue import Queue
 import numpy as np
 from numpy.linalg import norm
-from utils import timed
 from tqdm import tqdm
+import time
+import functools
+
+
+def timed(func):
+    # 函数运行计时
+    @functools.wraps(func)
+    def timed_wrapper(*args, **kwargs):
+        print(f'{func.__name__}', end=' ')
+        start_time = time.perf_counter()
+        result = func(*args, **kwargs)
+        end_time = time.perf_counter()
+        print(f'{end_time - start_time:.2f}s')
+        return result
+
+    return timed_wrapper
 
 
 class NeighborInfo:
@@ -43,7 +58,7 @@ class Model:
             if line == 'endheader':
                 break
         for line in lines[-(v_num + f_num):-f_num]:
-            x, y, z = line.split(' ')
+            x, y, z = line.split(' ')[:3]
             vertices.append([float(x), float(y), float(z)])
         for line in lines[-f_num:]:
             v1, v2, v3 = line.split(' ')[1:4]
@@ -111,17 +126,19 @@ class Model:
 
     @timed
     def compute_shortest(self):
-        from utils import parallel_run
+        import multiprocessing
         import functools
-        import c_utils
-        # Dijkstra算法
-        # https://leetcode.com/problems/network-delay-time/discuss/329376/efficient-oe-log-v-python-dijkstra-min-heap-with-explanation
-        # https://gist.github.com/kachayev/5990802
-        f_nbrs_id = [[n.fid for n in f.nbrs] + [-1] * (3 - len(f.nbrs)) for f in self.fs]
-        f_nbrs_dis = [[n.dis for n in f.nbrs] + [-1] * (3 - len(f.nbrs)) for f in self.fs]
+        import dijkstra
+        f_nbrs_id = [[n.fid for n in f.nbrs] for f in self.fs]  # 需要保证每个面片都有3个邻居
+        f_nbrs_dis = [[n.dis for n in f.nbrs] for f in self.fs]
+        assert all([len(x) == 3 for x in f_nbrs_id])
         f_nbrs_id, f_nbrs_dis = np.array(f_nbrs_id), np.array(f_nbrs_dis)
-        res = parallel_run(functools.partial(c_utils.dijkstra, f_nbrs_id, f_nbrs_dis), list(range(len(self.fs))), 6)
-        self.f_dis = res
+
+        num_proc = 6
+        with multiprocessing.Pool(num_proc) as p:
+            results = [res for res in p.imap(functools.partial(dijkstra.dijkstra_c, f_nbrs_id, f_nbrs_dis),
+                                             np.array_split(list(range(len(self.fs))), num_proc))]
+        self.f_dis = np.concatenate(results, axis=0)
 
     def compute_flow(self, f_types):
         # f_types是所有面片目前的类型：无关区域0 边界区域1，2 模糊区域3。
@@ -211,15 +228,16 @@ class Model:
                 f.write(f'3 {face.vids[0]} {face.vids[1]} {face.vids[2]} ')
                 label = face.label
                 f.write(f'{60 * (label % 4 + 1)} {80 * ((label + 1) % 3 + 1)} {50 * ((label + 2) % 5 + 1)}\n')
+        print(f'save to {ply_path}')
 
 
 class Solver:
     def __init__(self, model, level, fids=None):
-        # global variables
+        # global
         self.model = model
         self.fids = fids if fids else list(range(len(model.fs)))  # 对哪些面片做分解
         self.level = level  # 第几层
-        # local variables
+        # local
         self.fs = [model.fs[fid] for fid in self.fids]
         self.f_dis = model.f_dis[self.fids][:, self.fids]
 
@@ -229,6 +247,7 @@ class Solver:
 
         local_max_dis_fids = np.unravel_index(self.f_dis.argmax(), self.f_dis.shape)  # 最远的一对面片
         self.global_max_dis = self.model.f_dis.max() - self.model.f_dis.min()
+        assert self.global_max_dis != np.inf  # 必须是连通图
         self.global_avg_dis, self.local_avg_dis = average(self.model.f_dis), average(self.f_dis)
 
         def k_way_reps():
@@ -245,10 +264,11 @@ class Solver:
                 reps.append(rep)
                 G.append(max_dis)
             num = np.argmax([G[num] - G[num + 1] for num in range(len(G) - 2)]) + 2  # 最大化G[num]-G[num+1]
+            # NOTE: 如果想进行二路分解，只需要直接在此处设置num=2
             return num, reps[:num]  # 种子数和代表点
 
         self.num, self.reps = k_way_reps()  # 重要：reps是local变量
-        # BUGFIX: 用uniques, 只记录没有重复的reps的索引，有可能出现种子重复的情况，只考虑不重复的种子
+        # 用uniques, 只记录没有重复的reps的索引，有可能出现种子重复的情况，只考虑不重复的种子
         self.uniques = np.sort(np.unique(self.reps, return_index=True)[1])
 
         if self.num == 2:
@@ -274,20 +294,20 @@ class Solver:
                 if fid in self.reps:
                     prob[self.reps.index(fid)][fid] = 1
                     continue
-                sum_prob = sum([1 / self.f_dis[fid][rep] for rep in self.reps])
+                sum_prob = sum([1 / self.f_dis[fid][self.reps[u]] for u in self.uniques])  # 占比也只考虑不重合的点
                 prob[:, fid] = 1 / self.f_dis[fid][self.reps] / sum_prob  # 计算平均
 
-        def assign():
-            eps = 0.04
-
+        def assign():  # 给面片打标签
+            eps = 0.04 if self.num <= 3 else 0.02  # 确定清晰区域的0.5+eps阈值, 这个参数需要调，对分割结果影响较大
             counts = np.zeros(self.num)  # 每个类别的数量
-            self.uniques = np.sort(np.unique(self.reps, return_index=True)[1])
-            # 给面片打标签
             prob[[i for i in range(self.num) if i not in self.uniques]] = 0
             for fid in range(len(self.f_dis)):
-                # prob[:]=>prob[uniques]
-                label1, label2 = heapq.nlargest(2, range(len(self.uniques)), prob[self.uniques, fid].take)
-                prob1, prob2 = prob[label1][fid], prob[label2][fid]
+                if len(self.uniques) > 1:
+                    label1, label2 = heapq.nlargest(2, range(len(self.uniques)), prob[self.uniques, fid].take)
+                    prob1, prob2 = prob[label1][fid], prob[label2][fid]
+                else:
+                    label1, label2, prob1, prob2 = self.uniques[0], -1, 1.0, 0.0
+
                 if prob1 - prob2 > eps:
                     self.fs[fid].label = OFFSET + label1
                     counts[label1] += 1
@@ -317,8 +337,9 @@ class Solver:
             # STEP3: 判断是否更新
             old_cost = [rep_cost[i][rep] for i, rep in enumerate(self.reps)]
             changed = any([(c1 < c0 - 1e-12 and r1 != r0) for r1, r0, c1, c0 in zip(self.reps, reps, cost, old_cost)])
-            if changed and change_reps:  # BUGFIX: 最后break的位置update_rep()不要改变reps
+            if changed and change_reps:
                 self.reps = reps
+                self.uniques = np.sort(np.unique(self.reps, return_index=True)[1])
             return changed
 
         def assign_fuzzy():
@@ -362,9 +383,9 @@ class Solver:
             assign()
             change = update_rep()  # 每一步的依据都是用平均值估计的reps
             if not change:
-                assign()  # 按最终预估的reps分块
-                update_rep(change_reps=False)  # 按最终真实的reps计算概率 BUGFIX: 这里与它不一样
-                assign()  # 按最终真实的reps分块
+                assign()
+                update_rep(change_reps=False)
+                assign()
                 break
 
         assign_fuzzy()
@@ -373,7 +394,7 @@ class Solver:
         # 递归下去
         reps_f_dis = self.f_dis[self.reps][:, self.reps]
         local_max_patch_dis = np.max(reps_f_dis)
-        if self.level > 2:  # or local_max_patch_dis / self.global_max_dis < 0.1:
+        if self.level > 0 or local_max_patch_dis / self.global_max_dis < 0.1:  # 最多只递归一层
             return
 
         sub_solvers = []
@@ -390,4 +411,4 @@ class Solver:
 if __name__ == '__main__':
     mesh_model = Model('dino.ply')
     Solver(mesh_model, 0).solve()
-    mesh_model.write_ply('dino_k.ply')
+    mesh_model.write_ply('dino_output.ply')
