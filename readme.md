@@ -1,13 +1,15 @@
-## Mesh Segmentation
-python版本的***Hierarchical Mesh Decomposition using Fuzzy Clustering and Cuts***实现：
+# Mesh Segmentation
 
-- **用python和numpy实现，代码简洁**
-- **层次化k路/2路分解**
-- **中文注释帮助理解**
-- **最短路算法cython加速**
-- **某课程作业**
+python实现[***Hierarchical Mesh Decomposition using Fuzzy Clustering and Cuts***](https://dl.acm.org/doi/pdf/10.1145/882262.882369):
 
-#### 效果
+- 用python和numpy实现，代码简洁
+- 层次化k路分解
+- 中文注释帮助理解
+- 最短路算法cython加速
+- 某课程作业，谨慎参考
+
+效果
+----------------------
 
 <p float="left">
   <img src="./data/horse-output-left.png" height="300" />
@@ -23,12 +25,13 @@ python版本的***Hierarchical Mesh Decomposition using Fuzzy Clustering and Cut
 
 
 
-#### 运行
+运行
+----------------------
 安装依赖：
 ``` bash
 pip install -r requirements.txt
 ```
-编译cython：
+cython编译：
 ``` bash
 python setup.py build_ext --inplace
 ```
@@ -39,9 +42,10 @@ python main.py
 
 结果文件可以用MeshLab查看。
 
-#### 原理与代码结构
+原理与代码结构
+----------------------
 
-> ()内表示代码中相对应的函数
+> 圆括号内表示代码中对应的函数
 
 * 读入模型，算出面片的邻接信息【权值计算】`（compute_neighbor，compute_dis）`；
 * Dijkstra算法算出面片两两间的最短距离【最短距离计算】`（compute_shortest）`；
@@ -51,3 +55,6 @@ python main.py
   * 对每两类的模糊区域计算最大流（源类→模糊区域→汇类），Ford-Fulkerson增广路算法中BFS搜到的部分为源类，其余为汇类【区域划分: 模糊部分】`（assign_fuzzy，compute_flow）`；
   * 对不满足结束条件的子模型进行k路分解【层次化】。
 
+参考文献
+----------------------
+Katz S, Tal A. Hierarchical mesh decomposition using fuzzy clustering and cuts[J]. ACM transactions on graphics (TOG), 2003, 22(3): 954-961.
