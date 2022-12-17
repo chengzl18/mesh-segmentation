@@ -59,7 +59,3 @@ ply格式输入和输出可以用[MeshLab](https://www.meshlab.net/#download)查
 参考文献
 ----------------------
 Katz S, Tal A. Hierarchical mesh decomposition using fuzzy clustering and cuts[J]. ACM transactions on graphics (TOG), 2003, 22(3): 954-961.
-
-学术诚信
-----------------------
-课程作业，谨慎参考。如果你在作业中参考了此实现，可在作业报告中说明。
